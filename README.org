@@ -15,7 +15,7 @@ This package leverages [[https://github.com/laurynas-biveinis/mcp-server-lib.el]
 
 * Installation
 
-From MELPA:
+From [[https://melpa.org/#/elisp-dev-mcp][MELPA]] or [[https://stable.melpa.org/#/elisp-dev-mcp][MELPA Stable]]:
 
 =M-x package-install RET elisp-dev-mcp RET=
 
