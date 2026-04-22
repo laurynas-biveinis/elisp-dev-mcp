@@ -138,6 +138,10 @@ you can configure additional allowed directories:
 *Security Note:* Only add directories you trust, as this allows the
  MCP server to read any =.el= files in these locations.
 
+* Similar packages
+
+- [[https://codeberg.org/jlouisbiz/rcd-mcp-emacs-documentation][rcd-mcp-emacs-documentation]]
+
 * License
 
 This project is licensed under the GNU General Public License v3.0 (GPLv3) - see the LICENSE file for details.
