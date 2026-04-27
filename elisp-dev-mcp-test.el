@@ -1624,5 +1624,483 @@ X and Y are dynamically scoped arguments."
        "  \"\"\n"
        "  (* n 2))")))))
 
+;;; Structural Editing Tools Tests
+
+(defmacro elisp-dev-mcp-test--with-temp-el-file (file-var content &rest body)
+  "Create a temp .el file with CONTENT, bind path to FILE-VAR, run BODY.
+The file and its directory are deleted on exit."
+  (declare (indent 2) (debug t))
+  (let ((dir-sym (make-symbol "temp-dir")))
+    `(elisp-dev-mcp-test--with-temp-dir ,dir-sym "elisp-dev-mcp-edit-test"
+       (let ((,file-var (expand-file-name "test-edit.el" ,dir-sym)))
+         (with-temp-file ,file-var
+           (insert ,content))
+         ,@body))))
+
+;;; elisp-eval tests
+
+(ert-deftest elisp-dev-mcp-test-eval-basic ()
+  "Test eval with a simple arithmetic expression."
+  (let* ((parsed
+          (elisp-dev-mcp-test--get-parsed-response
+           "elisp-eval" '((code . "(+ 1 2)")))))
+    (should (string= (assoc-default 'result parsed) "3"))
+    (should (stringp (assoc-default 'output parsed)))))
+
+(ert-deftest elisp-dev-mcp-test-eval-message-output ()
+  "Test that eval captures message output."
+  (elisp-dev-mcp-test--with-server
+    (let* ((text
+            (mcp-server-lib-ert-call-tool
+             "elisp-eval" '((code . "(message \"hello world\")"))))
+           (parsed (json-read-from-string text)))
+      (should (string-match-p "hello world" (assoc-default 'output parsed))))))
+
+(ert-deftest elisp-dev-mcp-test-eval-error ()
+  "Test that eval errors are surfaced as tool errors."
+  (elisp-dev-mcp-test--with-server
+    (let* ((req
+            (mcp-server-lib-create-tools-call-request
+             "elisp-eval" 1 '((code . "(error \"deliberate test error\")"))))
+           (resp
+            (mcp-server-lib-process-jsonrpc-parsed
+             req mcp-server-lib-ert-server-id)))
+      (elisp-dev-mcp-test--verify-error-resp resp "deliberate test error"))))
+
+;;; elisp-check-parens tests
+
+(ert-deftest elisp-dev-mcp-test-check-parens-valid-code ()
+  "Test check-parens returns ok=true for balanced code."
+  (elisp-dev-mcp-test--with-server
+    (let* ((text
+            (mcp-server-lib-ert-call-tool
+             "elisp-check-parens" '((file-path . "") (code . "(+ 1 2)"))))
+           (parsed (json-read-from-string text)))
+      (should (eq (assoc-default 'ok parsed) t)))))
+
+(ert-deftest elisp-dev-mcp-test-check-parens-invalid-code ()
+  "Test check-parens returns ok=false with a message for unbalanced code."
+  (elisp-dev-mcp-test--with-server
+    (let* ((text
+            (mcp-server-lib-ert-call-tool
+             "elisp-check-parens" '((file-path . "") (code . "(+ 1 2"))))
+           (parsed (json-read-from-string text)))
+      (should (eq (assoc-default 'ok parsed) :json-false))
+      (should (stringp (assoc-default 'message parsed))))))
+
+(ert-deftest elisp-dev-mcp-test-check-parens-valid-file ()
+  "Test check-parens with a valid .el file on disk."
+  (elisp-dev-mcp-test--with-temp-el-file test-file
+      "(defun foo (x) (* x 2))\n"
+    (elisp-dev-mcp-test--with-server
+      (let* ((text
+              (mcp-server-lib-ert-call-tool
+               "elisp-check-parens" `((file-path . ,test-file))))
+             (parsed (json-read-from-string text)))
+        (should (eq (assoc-default 'ok parsed) t))))))
+
+(ert-deftest elisp-dev-mcp-test-check-parens-no-args ()
+  "Test check-parens errors when neither file-path nor code is provided."
+  (elisp-dev-mcp-test--with-server
+    (let* ((req
+            (mcp-server-lib-create-tools-call-request
+             "elisp-check-parens" 1 '((file-path . ""))))
+           (resp
+            (mcp-server-lib-process-jsonrpc-parsed
+             req mcp-server-lib-ert-server-id)))
+      (elisp-dev-mcp-test--verify-error-resp resp "Provide file-path or code"))))
+
+;;; elisp-read-file tests
+
+(ert-deftest elisp-dev-mcp-test-read-file-collapsed ()
+  "Test read-file in collapsed mode shows line-numbered signatures."
+  (elisp-dev-mcp-test--with-temp-el-file test-file
+      "(defun foo (x) (* x 2))\n\n(defvar bar 42 \"A var.\")\n"
+    (elisp-dev-mcp-test--with-server
+      (let* ((text
+              (mcp-server-lib-ert-call-tool
+               "elisp-read-file" `((file-path . ,test-file)))))
+        (should (string-match-p "L[ 0-9]+  (defun foo" text))
+        (should (string-match-p "L[ 0-9]+  (defvar bar" text))
+        ;; Collapsed: body should not appear
+        (should-not (string-match-p "(\\* x 2)" text))))))
+
+(ert-deftest elisp-dev-mcp-test-read-file-raw-mode ()
+  "Test read-file in raw mode returns source lines."
+  (elisp-dev-mcp-test--with-temp-el-file test-file
+      "(defun foo (x) (* x 2))\n"
+    (elisp-dev-mcp-test--with-server
+      (let* ((text
+              (mcp-server-lib-ert-call-tool
+               "elisp-read-file"
+               `((file-path . ,test-file)
+                 (collapsed . "false")
+                 (limit . "1")))))
+        (should (string-match-p "defun foo" text))))))
+
+(ert-deftest elisp-dev-mcp-test-read-file-name-pattern ()
+  "Test read-file expands only forms whose name matches name-pattern."
+  (elisp-dev-mcp-test--with-temp-el-file test-file
+      "(defun foo (x) (* x 2))\n\n(defun bar (y) (+ y 1))\n"
+    (elisp-dev-mcp-test--with-server
+      (let* ((text
+              (mcp-server-lib-ert-call-tool
+               "elisp-read-file"
+               `((file-path . ,test-file)
+                 (name-pattern . "^foo$")))))
+        ;; foo body should be expanded
+        (should (string-match-p "(\\* x 2)" text))
+        ;; bar body should remain collapsed
+        (should-not (string-match-p "(\\+ y 1)" text))))))
+
+(ert-deftest elisp-dev-mcp-test-read-file-not-found ()
+  "Test read-file with a non-existent path returns an error."
+  (elisp-dev-mcp-test--with-server
+    (let* ((req
+            (mcp-server-lib-create-tools-call-request
+             "elisp-read-file" 1
+             '((file-path . "/nonexistent/path/no-such-file.el"))))
+           (resp
+            (mcp-server-lib-process-jsonrpc-parsed
+             req mcp-server-lib-ert-server-id)))
+      (elisp-dev-mcp-test--verify-error-resp resp "File not found"))))
+
+;;; elisp-edit-form tests
+
+(ert-deftest elisp-dev-mcp-test-edit-form-replace ()
+  "Test edit-form replace writes new form content to disk."
+  (elisp-dev-mcp-test--with-temp-el-file test-file
+      "(defun foo (x)\n  (* x 2))\n"
+    (elisp-dev-mcp-test--with-server
+      (let* ((text
+              (mcp-server-lib-ert-call-tool
+               "elisp-edit-form"
+               `((file-path . ,test-file)
+                 (form-type . "defun")
+                 (form-name . "foo")
+                 (operation . "replace")
+                 (content . "(defun foo (x)\n  (* x 3))"))))
+             (parsed (json-read-from-string text)))
+        (should (eq (assoc-default 'would-change parsed) t))
+        (should (string= (assoc-default 'operation parsed) "replace"))
+        (with-temp-buffer
+          (insert-file-contents test-file)
+          (should (string-match-p "(\\* x 3)" (buffer-string))))))))
+
+(ert-deftest elisp-dev-mcp-test-edit-form-dry-run ()
+  "Test edit-form dry-run returns preview without modifying the file."
+  (elisp-dev-mcp-test--with-temp-el-file test-file
+      "(defun foo (x)\n  (* x 2))\n"
+    (elisp-dev-mcp-test--with-server
+      (let* ((original
+              (with-temp-buffer
+                (insert-file-contents test-file)
+                (buffer-string)))
+             (text
+              (mcp-server-lib-ert-call-tool
+               "elisp-edit-form"
+               `((file-path . ,test-file)
+                 (form-type . "defun")
+                 (form-name . "foo")
+                 (operation . "replace")
+                 (content . "(defun foo (x)\n  (* x 99))")
+                 (dry-run . "true"))))
+             (parsed (json-read-from-string text)))
+        (should (eq (assoc-default 'would-change parsed) t))
+        (should (assoc-default 'original parsed))
+        (should (string-match-p "(\\* x 99)" (assoc-default 'preview parsed)))
+        (with-temp-buffer
+          (insert-file-contents test-file)
+          (should (string= (buffer-string) original)))))))
+
+(ert-deftest elisp-dev-mcp-test-edit-form-insert-after ()
+  "Test edit-form insert_after appends a new form after the target."
+  (elisp-dev-mcp-test--with-temp-el-file test-file
+      "(defun foo (x)\n  (* x 2))\n"
+    (elisp-dev-mcp-test--with-server
+      (mcp-server-lib-ert-call-tool
+       "elisp-edit-form"
+       `((file-path . ,test-file)
+         (form-type . "defun")
+         (form-name . "foo")
+         (operation . "insert_after")
+         (content . "(defun bar (x)\n  (+ x 1))")))
+      (with-temp-buffer
+        (insert-file-contents test-file)
+        (should (string-match-p "defun bar" (buffer-string)))))))
+
+(ert-deftest elisp-dev-mcp-test-edit-form-insert-before ()
+  "Test edit-form insert_before prepends a form before the target."
+  (elisp-dev-mcp-test--with-temp-el-file test-file
+      "(defun foo (x)\n  (* x 2))\n"
+    (elisp-dev-mcp-test--with-server
+      (mcp-server-lib-ert-call-tool
+       "elisp-edit-form"
+       `((file-path . ,test-file)
+         (form-type . "defun")
+         (form-name . "foo")
+         (operation . "insert_before")
+         (content . "(defvar baz 0 \"A counter.\")")))
+      (with-temp-buffer
+        (insert-file-contents test-file)
+        (let ((content (buffer-string)))
+          (should (string-match-p "defvar baz" content))
+          (should
+           (< (string-match "defvar baz" content)
+              (string-match "defun foo" content))))))))
+
+(ert-deftest elisp-dev-mcp-test-edit-form-not-found ()
+  "Test edit-form errors when the named form does not exist in the file."
+  (elisp-dev-mcp-test--with-temp-el-file test-file
+      "(defun foo (x)\n  (* x 2))\n"
+    (elisp-dev-mcp-test--with-server
+      (let* ((req
+              (mcp-server-lib-create-tools-call-request
+               "elisp-edit-form" 1
+               `((file-path . ,test-file)
+                 (form-type . "defun")
+                 (form-name . "no-such-fn")
+                 (operation . "replace")
+                 (content . "(defun no-such-fn ())"))))
+             (resp
+              (mcp-server-lib-process-jsonrpc-parsed
+               req mcp-server-lib-ert-server-id)))
+        (elisp-dev-mcp-test--verify-error-resp resp "not found")))))
+
+(ert-deftest elisp-dev-mcp-test-edit-form-unknown-operation ()
+  "Test edit-form errors on an unrecognized operation name."
+  (elisp-dev-mcp-test--with-temp-el-file test-file
+      "(defun foo (x)\n  (* x 2))\n"
+    (elisp-dev-mcp-test--with-server
+      (let* ((req
+              (mcp-server-lib-create-tools-call-request
+               "elisp-edit-form" 1
+               `((file-path . ,test-file)
+                 (form-type . "defun")
+                 (form-name . "foo")
+                 (operation . "delete")
+                 (content . "(defun foo ())"))))
+             (resp
+              (mcp-server-lib-process-jsonrpc-parsed
+               req mcp-server-lib-ert-server-id)))
+        (elisp-dev-mcp-test--verify-error-resp resp "Unknown operation")))))
+
+;;; elisp-patch-form tests
+
+(ert-deftest elisp-dev-mcp-test-patch-form-basic ()
+  "Test patch-form replaces text within a form and writes the file."
+  (elisp-dev-mcp-test--with-temp-el-file test-file
+      "(defun foo (x)\n  (* x 2))\n"
+    (elisp-dev-mcp-test--with-server
+      (let* ((text
+              (mcp-server-lib-ert-call-tool
+               "elisp-patch-form"
+               `((file-path . ,test-file)
+                 (form-type . "defun")
+                 (form-name . "foo")
+                 (old-text . "(* x 2)")
+                 (new-text . "(* x 3)"))))
+             (parsed (json-read-from-string text)))
+        (should (eq (assoc-default 'would-change parsed) t))
+        (with-temp-buffer
+          (insert-file-contents test-file)
+          (should (string-match-p "(\\* x 3)" (buffer-string))))))))
+
+(ert-deftest elisp-dev-mcp-test-patch-form-dry-run ()
+  "Test patch-form dry-run returns preview without modifying the file."
+  (elisp-dev-mcp-test--with-temp-el-file test-file
+      "(defun foo (x)\n  (* x 2))\n"
+    (elisp-dev-mcp-test--with-server
+      (let* ((original
+              (with-temp-buffer
+                (insert-file-contents test-file)
+                (buffer-string)))
+             (text
+              (mcp-server-lib-ert-call-tool
+               "elisp-patch-form"
+               `((file-path . ,test-file)
+                 (form-type . "defun")
+                 (form-name . "foo")
+                 (old-text . "(* x 2)")
+                 (new-text . "(* x 99)")
+                 (dry-run . "true"))))
+             (parsed (json-read-from-string text)))
+        (should (eq (assoc-default 'would-change parsed) t))
+        (should (string-match-p "(\\* x 99)" (assoc-default 'preview parsed)))
+        (with-temp-buffer
+          (insert-file-contents test-file)
+          (should (string= (buffer-string) original)))))))
+
+(ert-deftest elisp-dev-mcp-test-patch-form-old-text-not-found ()
+  "Test patch-form errors when old-text is not present in the form."
+  (elisp-dev-mcp-test--with-temp-el-file test-file
+      "(defun foo (x)\n  (* x 2))\n"
+    (elisp-dev-mcp-test--with-server
+      (let* ((req
+              (mcp-server-lib-create-tools-call-request
+               "elisp-patch-form" 1
+               `((file-path . ,test-file)
+                 (form-type . "defun")
+                 (form-name . "foo")
+                 (old-text . "(+ x 99)")
+                 (new-text . "(* x 3)"))))
+             (resp
+              (mcp-server-lib-process-jsonrpc-parsed
+               req mcp-server-lib-ert-server-id)))
+        (elisp-dev-mcp-test--verify-error-resp resp "old-text not found")))))
+
+(ert-deftest elisp-dev-mcp-test-patch-form-ambiguous-match ()
+  "Test patch-form errors when old-text matches more than once in the form."
+  (elisp-dev-mcp-test--with-temp-el-file test-file
+      "(defun foo (x)\n  (list (* x 2) (* x 2)))\n"
+    (elisp-dev-mcp-test--with-server
+      (let* ((req
+              (mcp-server-lib-create-tools-call-request
+               "elisp-patch-form" 1
+               `((file-path . ,test-file)
+                 (form-type . "defun")
+                 (form-name . "foo")
+                 (old-text . "(* x 2)")
+                 (new-text . "(* x 3)"))))
+             (resp
+              (mcp-server-lib-process-jsonrpc-parsed
+               req mcp-server-lib-ert-server-id)))
+        (elisp-dev-mcp-test--verify-error-resp resp "matches [0-9]+ times")))))
+
+;;; Validation fix tests (Fix 1 & 2)
+
+(ert-deftest elisp-dev-mcp-test-edit-form-relative-path-rejected ()
+  "Test edit-form rejects a relative file-path before expand-file-name."
+  (elisp-dev-mcp-test--with-server
+    (let* ((req
+            (mcp-server-lib-create-tools-call-request
+             "elisp-edit-form" 1
+             '((file-path . "relative/path.el")
+               (form-type . "defun")
+               (form-name . "foo")
+               (operation . "replace")
+               (content . "(defun foo ())"))))
+           (resp
+            (mcp-server-lib-process-jsonrpc-parsed
+             req mcp-server-lib-ert-server-id)))
+      (elisp-dev-mcp-test--verify-error-resp resp "absolute path"))))
+
+(ert-deftest elisp-dev-mcp-test-edit-form-dotdot-path-rejected ()
+  "Test edit-form rejects a path containing '..' traversal."
+  (elisp-dev-mcp-test--with-server
+    (let* ((req
+            (mcp-server-lib-create-tools-call-request
+             "elisp-edit-form" 1
+             '((file-path . "/tmp/../etc/foo.el")
+               (form-type . "defun")
+               (form-name . "foo")
+               (operation . "replace")
+               (content . "(defun foo ())"))))
+           (resp
+            (mcp-server-lib-process-jsonrpc-parsed
+             req mcp-server-lib-ert-server-id)))
+      (elisp-dev-mcp-test--verify-error-resp resp "\\.\\."))))
+
+(ert-deftest elisp-dev-mcp-test-read-file-relative-path-rejected ()
+  "Test read-file rejects a relative path for non-library inputs."
+  (elisp-dev-mcp-test--with-server
+    (let* ((req
+            (mcp-server-lib-create-tools-call-request
+             "elisp-read-file" 1
+             '((file-path . "relative/file.el"))))
+           (resp
+            (mcp-server-lib-process-jsonrpc-parsed
+             req mcp-server-lib-ert-server-id)))
+      (elisp-dev-mcp-test--verify-error-resp resp "absolute path"))))
+
+(ert-deftest elisp-dev-mcp-test-read-file-non-el-path-rejected ()
+  "Test read-file rejects a non-.el absolute path."
+  (elisp-dev-mcp-test--with-server
+    (let* ((req
+            (mcp-server-lib-create-tools-call-request
+             "elisp-read-file" 1
+             '((file-path . "/tmp/not-an-elisp-file.txt"))))
+           (resp
+            (mcp-server-lib-process-jsonrpc-parsed
+             req mcp-server-lib-ert-server-id)))
+      (elisp-dev-mcp-test--verify-error-resp resp "\\.el"))))
+
+;;; Unsaved buffer guard tests (Fix 3)
+
+(ert-deftest elisp-dev-mcp-test-edit-form-unsaved-buffer-rejected ()
+  "Test edit-form errors when target file has unsaved buffer edits."
+  (elisp-dev-mcp-test--with-temp-el-file test-file
+      "(defun foo (x)\n  (* x 2))\n"
+    (elisp-dev-mcp-test--with-server
+      ;; Open the file in a buffer and make an unsaved change
+      (let ((buf (find-file-noselect test-file)))
+        (unwind-protect
+            (progn
+              (with-current-buffer buf
+                (goto-char (point-max))
+                (insert ";; unsaved\n"))
+              (let* ((req
+                      (mcp-server-lib-create-tools-call-request
+                       "elisp-edit-form" 1
+                       `((file-path . ,test-file)
+                         (form-type . "defun")
+                         (form-name . "foo")
+                         (operation . "replace")
+                         (content . "(defun foo (x) x)"))))
+                     (resp
+                      (mcp-server-lib-process-jsonrpc-parsed
+                       req mcp-server-lib-ert-server-id)))
+                (elisp-dev-mcp-test--verify-error-resp resp "unsaved changes")))
+          (with-current-buffer buf
+            (set-buffer-modified-p nil))
+          (kill-buffer buf))))))
+
+(ert-deftest elisp-dev-mcp-test-patch-form-unsaved-buffer-rejected ()
+  "Test patch-form errors when target file has unsaved buffer edits."
+  (elisp-dev-mcp-test--with-temp-el-file test-file
+      "(defun foo (x)\n  (* x 2))\n"
+    (elisp-dev-mcp-test--with-server
+      (let ((buf (find-file-noselect test-file)))
+        (unwind-protect
+            (progn
+              (with-current-buffer buf
+                (goto-char (point-max))
+                (insert ";; unsaved\n"))
+              (let* ((req
+                      (mcp-server-lib-create-tools-call-request
+                       "elisp-patch-form" 1
+                       `((file-path . ,test-file)
+                         (form-type . "defun")
+                         (form-name . "foo")
+                         (old-text . "(* x 2)")
+                         (new-text . "(* x 3)"))))
+                     (resp
+                      (mcp-server-lib-process-jsonrpc-parsed
+                       req mcp-server-lib-ert-server-id)))
+                (elisp-dev-mcp-test--verify-error-resp resp "unsaved changes")))
+          (with-current-buffer buf
+            (set-buffer-modified-p nil))
+          (kill-buffer buf))))))
+
+;;; Empty old-text guard test (Fix 4)
+
+(ert-deftest elisp-dev-mcp-test-patch-form-empty-old-text-rejected ()
+  "Test patch-form rejects empty old-text to prevent infinite loop."
+  (elisp-dev-mcp-test--with-temp-el-file test-file
+      "(defun foo (x)\n  (* x 2))\n"
+    (elisp-dev-mcp-test--with-server
+      (let* ((req
+              (mcp-server-lib-create-tools-call-request
+               "elisp-patch-form" 1
+               `((file-path . ,test-file)
+                 (form-type . "defun")
+                 (form-name . "foo")
+                 (old-text . "")
+                 (new-text . "replacement"))))
+             (resp
+              (mcp-server-lib-process-jsonrpc-parsed
+               req mcp-server-lib-ert-server-id)))
+        (elisp-dev-mcp-test--verify-error-resp resp "non-empty string")))))
+
 (provide 'elisp-dev-mcp-test)
 ;;; elisp-dev-mcp-test.el ends here
