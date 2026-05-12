@@ -770,6 +770,451 @@ MCP Parameters:
            (insert-file-contents true-path)
            (buffer-string)))))))
 
+;;; Structural File Tools
+
+(defun elisp-dev-mcp--read-any-el-file (path)
+  "Read PATH (absolute) as a string.  Handles .el and .el.gz files.
+Unlike `elisp-dev-mcp--read-source-file', imposes no directory restriction."
+  (unless (file-exists-p path)
+    (mcp-server-lib-tool-throw (format "File not found: %s" path)))
+  (elisp-dev-mcp--with-auto-compression
+    (with-temp-buffer
+      (insert-file-contents path)
+      (buffer-string))))
+
+(defun elisp-dev-mcp--validate-writable-el-path (file-path)
+  "Validate FILE-PATH as an absolute, writable .el file.
+Returns the expanded path or signals a tool error."
+  (unless (stringp file-path)
+    (mcp-server-lib-tool-throw "file-path must be a string"))
+  (unless (file-name-absolute-p file-path)
+    (mcp-server-lib-tool-throw "file-path must be an absolute path"))
+  (when (string-match-p "\\.\\." file-path)
+    (mcp-server-lib-tool-throw "Path contains illegal '..' traversal"))
+  (let ((expanded (expand-file-name file-path)))
+    (unless (string-suffix-p ".el" expanded)
+      (mcp-server-lib-tool-throw "file-path must end in .el"))
+    (unless (file-exists-p expanded)
+      (mcp-server-lib-tool-throw (format "File not found: %s" expanded)))
+    (unless (file-writable-p expanded)
+      (mcp-server-lib-tool-throw (format "File not writable: %s" expanded)))
+    expanded))
+
+(defun elisp-dev-mcp--resolve-el-path (file-path)
+  "Resolve FILE-PATH to an absolute path.
+Accepts library names (e.g. \"org\") or absolute paths."
+  (if (elisp-dev-mcp--library-name-p file-path)
+      (elisp-dev-mcp--resolve-library-to-source-path file-path)
+    (progn
+      (unless (file-name-absolute-p file-path)
+        (mcp-server-lib-tool-throw "file-path must be an absolute path"))
+      (unless (or (string-suffix-p ".el" file-path)
+                  (string-suffix-p ".el.gz" file-path))
+        (mcp-server-lib-tool-throw "file-path must end in .el or .el.gz"))
+      (expand-file-name file-path))))
+
+(defun elisp-dev-mcp--scan-forms-in-buffer ()
+  "Return list of (START . END) buffer positions for all top-level forms.
+Operates on the current buffer.  Skips top-level comments and blank lines."
+  (save-excursion
+    (let ((forms '()))
+      (goto-char (point-min))
+      (while (not (eobp))
+        (skip-chars-forward " \t\n\r")
+        (while (and (not (eobp)) (looking-at "[ \t]*;"))
+          (forward-line 1)
+          (skip-chars-forward " \t\n\r"))
+        (unless (eobp)
+          (let ((start (point)))
+            (condition-case nil
+                (progn
+                  (forward-sexp 1)
+                  (push (cons start (point)) forms))
+              (scan-error
+               (goto-char (point-max)))))))
+      (nreverse forms))))
+
+(defun elisp-dev-mcp--form-type-and-name (start end)
+  "Return (TYPE NAME) for the form at buffer positions START..END.
+TYPE is a downcased string.  Returns nil when the form cannot be identified."
+  (condition-case nil
+      (let* ((text (buffer-substring-no-properties start end))
+             (form (car (read-from-string text)))
+             (car-sym (and (consp form) (car form))))
+        (when (symbolp car-sym)
+          (let* ((type (downcase (symbol-name car-sym)))
+                 (raw-name (cadr form))
+                 (name
+                  (cond
+                   ((symbolp raw-name) (symbol-name raw-name))
+                   ((and (consp raw-name)
+                         (eq (car raw-name) 'setf)
+                         (symbolp (cadr raw-name)))
+                    (format "(setf %s)" (cadr raw-name)))
+                   ((stringp raw-name) raw-name)
+                   (t nil))))
+            (when name (list type name)))))
+    (error nil)))
+
+(defun elisp-dev-mcp--form-signature (start end)
+  "Return a collapsed one-line signature for the form at START..END.
+Includes a line-number prefix for navigation."
+  (condition-case nil
+      (let* ((text (buffer-substring-no-properties start end))
+             (form (car (read-from-string text)))
+             (car-sym (and (consp form) (car form)))
+             (type (and (symbolp car-sym) (symbol-name car-sym)))
+             (type-lc (and type (downcase type)))
+             (name (cadr form))
+             (line (line-number-at-pos start)))
+        (cond
+         ((member type-lc '("defun" "defmacro" "defsubst" "defun*"
+                            "cl-defun" "cl-defmacro"))
+          (format "L%4d  (%s %s %S ...)" line type name (caddr form)))
+         ((member type-lc '("defvar" "defconst" "defcustom" "defface"
+                            "defgroup" "deftheme" "defvar-local"))
+          (format "L%4d  (%s %s ...)" line type name))
+         ((string= type-lc "use-package")
+          (format "L%4d  (use-package %s ...)" line name))
+         ((member type-lc '("require" "provide"))
+          (format "L%4d  (%s '%s)" line type name))
+         (t
+          (let ((first-line
+                 (string-trim-right (car (split-string text "\n")))))
+            (format "L%4d  %s ..."
+                    line
+                    (if (> (length first-line) 80)
+                        (substring first-line 0 80)
+                      first-line))))))
+    (error
+     (let* ((text (buffer-substring-no-properties start end))
+            (first-line (string-trim-right (car (split-string text "\n"))))
+            (line (line-number-at-pos start)))
+       (format "L%4d  %s ..."
+               line
+               (if (> (length first-line) 80)
+                   (substring first-line 0 80)
+                 first-line))))))
+
+(defun elisp-dev-mcp--find-form-bounds (form-type form-name)
+  "Find form (FORM-TYPE FORM-NAME ...) in the current buffer.
+Returns (start . end) buffer positions or signals a tool error."
+  (let* ((type-lc (downcase form-type))
+         (forms (elisp-dev-mcp--scan-forms-in-buffer))
+         (matches '()))
+    (dolist (bounds forms)
+      (let ((tn (elisp-dev-mcp--form-type-and-name
+                 (car bounds) (cdr bounds))))
+        (when (and tn
+                   (string= (car tn) type-lc)
+                   (string= (cadr tn) form-name))
+          (push bounds matches))))
+    (cond
+     ((null matches)
+      (mcp-server-lib-tool-throw
+       (format "Form (%s %s) not found" form-type form-name)))
+     ((> (length matches) 1)
+      (mcp-server-lib-tool-throw
+       (format "Multiple matches for (%s %s); be more specific"
+               form-type form-name)))
+     (t (car matches)))))
+
+;;; Tool: elisp-eval
+
+(defun elisp-dev-mcp--eval (code)
+  "Evaluate Emacs Lisp CODE in the running Emacs instance.
+Wraps multiple expressions in `progn'.  Returns result and any message output.
+
+MCP Parameters:
+  code - Emacs Lisp expression(s) to evaluate"
+  (mcp-server-lib-with-error-handling
+   (unless (and (stringp code) (not (string-empty-p code)))
+     (mcp-server-lib-tool-throw "code must be a non-empty string"))
+   (let (result output-list)
+     (cl-letf (((symbol-function 'message)
+                (lambda (fmt &rest args)
+                  (push (apply #'format fmt args) output-list)
+                  nil)))
+       (condition-case err
+           (setq result
+                 (eval (read (concat "(progn " code ")")) t))
+         (error
+          (mcp-server-lib-tool-throw
+           (format "Eval error: %s" (error-message-string err))))))
+     (json-encode
+      `((result . ,(format "%S" result))
+        (output . ,(mapconcat #'identity (nreverse output-list) "\n")))))))
+
+;;; Tool: elisp-read-file
+
+(defun elisp-dev-mcp--read-file (file-path &optional collapsed
+                                            name-pattern content-pattern
+                                            offset limit)
+  "Read an Elisp file with an optional collapsed form-signature view.
+In collapsed mode (default) each top-level form is shown as a one-line
+signature with its line number.  Forms whose name or body match the
+supplied regex patterns are expanded to their full text.
+
+MCP Parameters:
+  file-path - Library name (e.g. \"org\") or absolute .el/.el.gz path
+  collapsed - \"true\" (default) for signatures, \"false\" for raw lines
+  name-pattern - Regex: expand forms whose name matches (collapsed mode)
+  content-pattern - Regex: expand forms whose body matches (collapsed mode)
+  offset - Starting line number for raw mode (default 0)
+  limit - Maximum lines for raw mode (default 500)"
+  (mcp-server-lib-with-error-handling
+   (when (or (not (stringp file-path)) (string-empty-p file-path))
+     (mcp-server-lib-tool-throw "file-path is required"))
+   (let* ((resolved (elisp-dev-mcp--resolve-el-path file-path))
+          (content (elisp-dev-mcp--read-any-el-file resolved))
+          (collapsed-p (not (equal collapsed "false"))))
+     (if collapsed-p
+         (with-temp-buffer
+           (insert content)
+           (let* ((forms (elisp-dev-mcp--scan-forms-in-buffer))
+                  (name-rx (and (stringp name-pattern)
+                                (not (string-empty-p name-pattern))
+                                name-pattern))
+                  (content-rx (and (stringp content-pattern)
+                                   (not (string-empty-p content-pattern))
+                                   content-pattern))
+                  (parts '()))
+             (dolist (bounds forms)
+               (let* ((start (car bounds))
+                      (end (cdr bounds))
+                      (text (buffer-substring-no-properties start end))
+                      (tn (elisp-dev-mcp--form-type-and-name start end))
+                      (form-name (and tn (cadr tn)))
+                      (expand-p
+                       (or (and name-rx form-name
+                                (condition-case nil
+                                    (string-match-p name-rx form-name)
+                                  (error nil)))
+                           (and content-rx
+                                (condition-case nil
+                                    (string-match-p content-rx text)
+                                  (error nil))))))
+                 (push (if expand-p text
+                         (elisp-dev-mcp--form-signature start end))
+                       parts)))
+             (mapconcat #'identity (nreverse parts) "\n\n")))
+       ;; Raw slice mode
+       (let* ((lines (split-string content "\n"))
+              (total (length lines))
+              (off (if (and (stringp offset) (not (string-empty-p offset)))
+                       (max 0 (string-to-number offset))
+                     0))
+              (lim (if (and (stringp limit) (not (string-empty-p limit)))
+                       (string-to-number limit)
+                     500))
+              (end-line (min (+ off lim) total))
+              (slice (mapconcat #'identity
+                                (seq-subseq lines off end-line)
+                                "\n")))
+         (if (< end-line total)
+             (format
+              "%s\n[Showing lines %d-%d of %d. Use offset=%d to read more.]"
+              slice (1+ off) end-line total end-line)
+           slice))))))
+
+;;; Tool: elisp-check-parens
+
+(defun elisp-dev-mcp--check-parens (file-path &optional code)
+  "Check for unbalanced parentheses/brackets in a file or code string.
+Returns JSON with ok=true, or ok=false with an error message.
+
+MCP Parameters:
+  file-path - Absolute path to .el file to check (pass empty string to use code)
+  code - Elisp code string to check (used when file-path is empty)"
+  (mcp-server-lib-with-error-handling
+   (let ((content
+          (cond
+           ((and (stringp file-path) (not (string-empty-p file-path)))
+            (elisp-dev-mcp--read-any-el-file
+             (expand-file-name file-path)))
+           ((and (stringp code) (not (string-empty-p code)))
+            code)
+           (t
+            (mcp-server-lib-tool-throw
+             "Provide file-path or code")))))
+     (with-temp-buffer
+       (emacs-lisp-mode)
+       (insert content)
+       (condition-case err
+           (progn
+             (check-parens)
+             (json-encode '((ok . t))))
+         (error
+          (json-encode
+           `((ok . :json-false)
+             (message . ,(error-message-string err))))))))))
+
+;;; Tool: elisp-edit-form
+
+(defun elisp-dev-mcp--edit-form (file-path form-type form-name operation
+                                            content &optional dry-run)
+  "Structurally edit a top-level Elisp form using replace or insert operations.
+Finds the form by type and name, applies the operation, and writes the file.
+If the file is open in Emacs the buffer is reverted automatically.
+
+MCP Parameters:
+  file-path - Absolute path to .el file to edit
+  form-type - Form type: defun, defvar, defcustom, use-package, etc.
+  form-name - Name of the form to locate
+  operation - One of: replace, insert_before, insert_after
+  content - Complete form text to use in the operation
+  dry-run - \"true\" to preview without writing (default: false)"
+  (mcp-server-lib-with-error-handling
+   (dolist (pair `(("file-path" . ,file-path) ("form-type" . ,form-type)
+                   ("form-name" . ,form-name) ("operation" . ,operation)
+                   ("content" . ,content)))
+     (when (or (not (stringp (cdr pair))) (string-empty-p (cdr pair)))
+       (mcp-server-lib-tool-throw
+        (format "%s must be a non-empty string" (car pair)))))
+   (let* ((abs-path (elisp-dev-mcp--validate-writable-el-path file-path))
+          (dry-run-p (equal dry-run "true"))
+          (op-lc (downcase operation))
+          (file-content (elisp-dev-mcp--read-any-el-file abs-path)))
+     (unless dry-run-p
+       (let ((visiting-buf (find-buffer-visiting abs-path)))
+         (when (and visiting-buf (buffer-modified-p visiting-buf))
+           (mcp-server-lib-tool-throw
+            (format "Buffer visiting %s has unsaved changes; save it first"
+                    abs-path)))))
+     (unless (member op-lc '("replace" "insert_before" "insert_after"))
+       (mcp-server-lib-tool-throw
+        (format "Unknown operation: %s. Use replace, insert_before, or insert_after"
+                operation)))
+     (with-temp-buffer
+       (insert file-content)
+       (let* ((bounds (elisp-dev-mcp--find-form-bounds form-type form-name))
+              (start (car bounds))
+              (end (cdr bounds))
+              (original-form (buffer-substring-no-properties start end)))
+         (cond
+          ((string= op-lc "replace")
+           (delete-region start end)
+           (goto-char start)
+           (insert content))
+          ((string= op-lc "insert_before")
+           (goto-char start)
+           (insert content "\n\n"))
+          ((string= op-lc "insert_after")
+           (goto-char end)
+           (insert "\n\n" content)))
+         (let* ((updated (buffer-string))
+                (changed (not (string= file-content updated))))
+           (if dry-run-p
+               (json-encode
+                `((would-change . ,(elisp-dev-mcp--json-bool changed))
+                  (operation . ,op-lc)
+                  (form-type . ,form-type)
+                  (form-name . ,form-name)
+                  (original . ,original-form)
+                  (preview . ,updated)))
+             (when changed
+               (with-temp-file abs-path
+                 (insert updated))
+               (let ((buf (find-buffer-visiting abs-path)))
+                 (when buf
+                   (with-current-buffer buf
+                     (revert-buffer t t t)))))
+             (json-encode
+              `((would-change . ,(elisp-dev-mcp--json-bool changed))
+                (operation . ,op-lc)
+                (form-type . ,form-type)
+                (form-name . ,form-name)
+                (file-path . ,abs-path))))))))))
+
+;;; Tool: elisp-patch-form
+
+(defun elisp-dev-mcp--patch-form (file-path form-type form-name
+                                             old-text new-text &optional dry-run)
+  "Replace exact text within a top-level Elisp form (token-efficient small edits).
+old-text must appear exactly once within the matched form.
+
+MCP Parameters:
+  file-path - Absolute path to .el file to edit
+  form-type - Form type: defun, defvar, etc.
+  form-name - Name of the form to target
+  old-text - Exact text to find within the form (must match exactly once)
+  new-text - Replacement text
+  dry-run - \"true\" to preview without writing (default: false)"
+  (mcp-server-lib-with-error-handling
+   (dolist (pair `(("file-path" . ,file-path) ("form-type" . ,form-type)
+                   ("form-name" . ,form-name) ("old-text" . ,old-text)))
+     (when (not (stringp (cdr pair)))
+       (mcp-server-lib-tool-throw
+        (format "%s must be a string" (car pair)))))
+   (unless (stringp new-text)
+     (mcp-server-lib-tool-throw "new-text must be a string"))
+   (when (string-empty-p old-text)
+     (mcp-server-lib-tool-throw "old-text must be a non-empty string"))
+   (let* ((abs-path (elisp-dev-mcp--validate-writable-el-path file-path))
+          (dry-run-p (equal dry-run "true"))
+          (file-content (elisp-dev-mcp--read-any-el-file abs-path)))
+     (unless dry-run-p
+       (let ((visiting-buf (find-buffer-visiting abs-path)))
+         (when (and visiting-buf (buffer-modified-p visiting-buf))
+           (mcp-server-lib-tool-throw
+            (format "Buffer visiting %s has unsaved changes; save it first"
+                    abs-path)))))
+     (with-temp-buffer
+       (insert file-content)
+       (let* ((bounds (elisp-dev-mcp--find-form-bounds form-type form-name))
+              (form-start (car bounds))
+              (form-end (cdr bounds))
+              (form-text (buffer-substring-no-properties form-start form-end))
+              (occurrences 0)
+              (search-pos 0))
+         ;; Count occurrences of old-text within the form
+         (while (setq search-pos
+                      (cl-search old-text form-text :start2 search-pos))
+           (setq occurrences (1+ occurrences))
+           (setq search-pos (1+ search-pos)))
+         (cond
+          ((= occurrences 0)
+           (mcp-server-lib-tool-throw
+            (format "old-text not found in (%s %s)" form-type form-name)))
+          ((> occurrences 1)
+           (mcp-server-lib-tool-throw
+            (format "old-text matches %d times in (%s %s); must match exactly once"
+                    occurrences form-type form-name)))
+          (t
+           (let* ((match-pos (cl-search old-text form-text))
+                  (new-form
+                   (concat (substring form-text 0 match-pos)
+                           new-text
+                           (substring form-text
+                                      (+ match-pos (length old-text)))))
+                  ;; Buffer positions are 1-based; convert to string indices
+                  (str-start (1- form-start))
+                  (str-end (1- form-end))
+                  (updated
+                   (concat (substring file-content 0 str-start)
+                           new-form
+                           (substring file-content str-end)))
+                  (changed (not (string= file-content updated))))
+             (if dry-run-p
+                 (json-encode
+                  `((would-change . ,(elisp-dev-mcp--json-bool changed))
+                    (form-type . ,form-type)
+                    (form-name . ,form-name)
+                    (original . ,form-text)
+                    (preview . ,new-form)))
+               (when changed
+                 (with-temp-file abs-path
+                   (insert updated))
+                 (let ((buf (find-buffer-visiting abs-path)))
+                   (when buf
+                     (with-current-buffer buf
+                       (revert-buffer t t t)))))
+               (json-encode
+                `((would-change . ,(elisp-dev-mcp--json-bool changed))
+                  (form-type . ,form-type)
+                  (form-name . ,form-name)
+                  (file-path . ,abs-path))))))))))))
+
 ;;;###autoload
 (defun elisp-dev-mcp-enable ()
   "Enable the Elisp development MCP tools."
@@ -964,7 +1409,121 @@ Error cases:
 - Path traversal attempts
 - Access outside allowed directories
 - File not found"
-   :read-only t))
+   :read-only t)
+  (mcp-server-lib-register-tool
+   #'elisp-dev-mcp--eval
+   :id "elisp-eval"
+   :server-id elisp-dev-mcp--server-id
+   :description
+   "Evaluate Emacs Lisp code in the running Emacs instance and return the result.
+Multiple expressions are wrapped in progn; the last value is returned.
+
+Parameters:
+  code - Emacs Lisp expression(s) to evaluate (string)
+
+Returns JSON with:
+  result - The return value formatted with %S
+  output - Any message() output produced during evaluation
+
+Error cases:
+- Invalid or empty code returns an error
+- Runtime errors (wrong-type-argument, void-variable, etc.) are reported")
+  (mcp-server-lib-register-tool
+   #'elisp-dev-mcp--read-file
+   :id "elisp-read-file"
+   :server-id elisp-dev-mcp--server-id
+   :description
+   "Read an Elisp file with a collapsed form-signature view for easy navigation.
+Prefer this over elisp-read-source-file for your own .el config files.
+
+In collapsed mode (default) each top-level form is shown as a one-line
+signature prefixed with its line number (e.g. \"L  42  (defun foo (x) ...)\").
+Supply name-pattern or content-pattern to expand matching forms to full text.
+Use collapsed=false for a raw line-slice (offset/limit control the window).
+
+Parameters:
+  file-path - Library name (e.g. \"org\") or absolute path to .el/.el.gz
+  collapsed - \"true\" (default) or \"false\" for raw line mode
+  name-pattern - Regex: expand forms whose name matches (collapsed mode only)
+  content-pattern - Regex: expand forms whose body matches (collapsed mode only)
+  offset - Starting line for raw mode (default 0)
+  limit - Max lines for raw mode (default 500)
+
+Returns the formatted file content as a string."
+   :read-only t)
+  (mcp-server-lib-register-tool
+   #'elisp-dev-mcp--check-parens
+   :id "elisp-check-parens"
+   :server-id elisp-dev-mcp--server-id
+   :description
+   "Check for unbalanced parentheses/brackets in an Elisp file or code string.
+Uses Emacs's native check-parens for accurate detection.
+
+Parameters:
+  file-path - Absolute path to .el file (pass empty string to use code instead)
+  code - Elisp code string (used when file-path is empty)
+
+Returns JSON with:
+  ok - true if balanced, false if not
+  message - Error description with location when ok is false
+
+Error cases:
+- Neither file-path nor code provided
+- File not found"
+   :read-only t)
+  (mcp-server-lib-register-tool
+   #'elisp-dev-mcp--edit-form
+   :id "elisp-edit-form"
+   :server-id elisp-dev-mcp--server-id
+   :description
+   "Structurally edit a top-level Elisp form in a file.
+Finds the form by (form-type, form-name) and applies replace or insert.
+If the file is open in Emacs the buffer is reverted automatically after writing.
+
+Parameters:
+  file-path - Absolute path to .el file to edit
+  form-type - Form constructor: defun, defmacro, defvar, defcustom,
+              defface, defgroup, use-package, etc.
+  form-name - Name of the form (e.g. \"my-function\" or \"(setf my-accessor)\")
+  operation - One of: replace, insert_before, insert_after
+  content - Complete form text for the operation (including outer parens)
+  dry-run - \"true\" to preview without writing (default: \"false\")
+
+Returns JSON with:
+  would-change - Whether the operation modifies the file
+  operation, form-type, form-name - Echoed inputs
+  file-path - Absolute path written (non-dry-run only)
+  original - Matched form text before change (dry-run only)
+  preview - Full file preview with changes applied (dry-run only)
+
+Error cases:
+- Form not found, multiple matches, unknown operation, unwritable file")
+  (mcp-server-lib-register-tool
+   #'elisp-dev-mcp--patch-form
+   :id "elisp-patch-form"
+   :server-id elisp-dev-mcp--server-id
+   :description
+   "Token-efficient text replacement within a single top-level Elisp form.
+Prefer this over elisp-edit-form for small edits inside large forms.
+old-text is matched literally (whitespace-sensitive) and must occur exactly once.
+
+Parameters:
+  file-path - Absolute path to .el file to edit
+  form-type - Form type: defun, defvar, defcustom, etc.
+  form-name - Name of the form to target
+  old-text - Exact text to replace (must match exactly once within the form)
+  new-text - Replacement text
+  dry-run - \"true\" to preview without writing (default: \"false\")
+
+Returns JSON with:
+  would-change - Whether old-text differs from new-text
+  form-type, form-name - Echoed inputs
+  file-path - Absolute path written (non-dry-run only)
+  original - Full original form text (dry-run only)
+  preview - Modified form text after replacement (dry-run only)
+
+Error cases:
+- old-text not found in form, old-text matches more than once, file not writable"))
 
 ;;;###autoload
 (defun elisp-dev-mcp-disable ()
@@ -978,7 +1537,17 @@ Error cases:
   (mcp-server-lib-unregister-tool
    "elisp-info-lookup-symbol" elisp-dev-mcp--server-id)
   (mcp-server-lib-unregister-tool
-   "elisp-read-source-file" elisp-dev-mcp--server-id))
+   "elisp-read-source-file" elisp-dev-mcp--server-id)
+  (mcp-server-lib-unregister-tool
+   "elisp-eval" elisp-dev-mcp--server-id)
+  (mcp-server-lib-unregister-tool
+   "elisp-read-file" elisp-dev-mcp--server-id)
+  (mcp-server-lib-unregister-tool
+   "elisp-check-parens" elisp-dev-mcp--server-id)
+  (mcp-server-lib-unregister-tool
+   "elisp-edit-form" elisp-dev-mcp--server-id)
+  (mcp-server-lib-unregister-tool
+   "elisp-patch-form" elisp-dev-mcp--server-id))
 
 (provide 'elisp-dev-mcp)
 ;;; elisp-dev-mcp.el ends here
