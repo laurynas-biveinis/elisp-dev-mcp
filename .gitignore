@@ -1,8 +1,12 @@
-**/.claude/settings.local.json
 *.elc
+*~
+/.DS_Store
 *-autoloads.el
 *-pkg.el
 
 # Eask
 .eask/
 dist/
+
+# Local Claude settings
+**/.claude/settings.local.json
