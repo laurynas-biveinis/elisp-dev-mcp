@@ -1,4 +1,5 @@
 ;;; elisp-dev-mcp.el --- MCP server for agentic Elisp development -*- lexical-binding: t -*-
+;; jscpd:ignore-start
 
 ;; Copyright (C) 2025-2026 elisp-dev-mcp.el contributors
 
@@ -25,6 +26,7 @@
 
 ;; This package provides an MCP server for agentic Elisp development.
 
+;; jscpd:ignore-end
 ;;; Code:
 
 (require 'mcp-server-lib)

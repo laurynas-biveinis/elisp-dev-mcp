@@ -1,4 +1,5 @@
 ;;; elisp-dev-mcp-bytecode-test.el --- Bytecode test functions -*- lexical-binding: t -*-
+;; jscpd:ignore-start
 
 ;; Copyright (C) 2025 Laurynas Biveinis
 
@@ -26,6 +27,7 @@
 ;; tools work correctly with byte-compiled code.  Some functions
 ;; intentionally lack documentation for testing purposes.
 
+;; jscpd:ignore-end
 ;;; Code:
 
 ;; Header comment for byte-compiled function

@@ -1,4 +1,5 @@
 ;;; elisp-dev-mcp-dynamic-test.el --- Test fixtures for dynamic binding -*- lexical-binding: nil -*-
+;; jscpd:ignore-start
 
 ;; Copyright (C) 2025 Laurynas Biveinis
 
@@ -25,6 +26,7 @@
 ;; This file intentionally uses dynamic binding to create
 ;; functions with dynamic binding behavior for testing purposes.
 
+;; jscpd:ignore-end
 ;;; Code:
 
 ;; This is a header comment that should be included

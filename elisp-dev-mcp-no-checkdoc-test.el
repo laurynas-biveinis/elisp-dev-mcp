@@ -1,4 +1,5 @@
 ;;; elisp-dev-mcp-no-checkdoc-test.el --- Test fixtures exempt from checkdoc -*- lexical-binding: t -*-
+;; jscpd:ignore-start
 
 ;; Copyright (C) 2025 Laurynas Biveinis
 
@@ -24,6 +25,7 @@
 ;; This file contains functions that intentionally violate documentation
 ;; requirements for testing purposes.
 
+;; jscpd:ignore-end
 ;;; Code:
 
 (defun elisp-dev-mcp-no-checkdoc-test--no-docstring (x y)
