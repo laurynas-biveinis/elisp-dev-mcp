@@ -1,4 +1,5 @@
 ;;; elisp-dev-mcp-test.el --- Tests for elisp-dev-mcp -*- lexical-binding: t -*-
+;; jscpd:ignore-start
 
 ;; Copyright (C) 2025-2026 elisp-dev-mcp.el contributors
 
@@ -24,6 +25,7 @@
 
 ;; Tests for the elisp-dev-mcp package.
 
+;; jscpd:ignore-end
 ;;; Code:
 
 (require 'ert)
@@ -215,29 +217,31 @@ Returns the parsed JSON response."
     error-pattern
     (mcp-server-lib-ert-check-text-response response t))))
 
-(defun elisp-dev-mcp-test--verify-empty-name (tool-name param-name)
-  "Verify empty name handling for TOOL-NAME with PARAM-NAME."
+(defun elisp-dev-mcp-test--verify-tool-call-error
+    (tool-name args expected-msg)
+  "Call TOOL-NAME with ARGS and verify the error response is EXPECTED-MSG."
   (elisp-dev-mcp-test--with-server
     (let* ((req
             (mcp-server-lib-create-tools-call-request
-             tool-name 1 `((,param-name . ""))))
+             tool-name 1 args))
            (resp
             (mcp-server-lib-process-jsonrpc-parsed
              req mcp-server-lib-ert-server-id)))
-      (elisp-dev-mcp-test--verify-error-resp
-       resp (format "Empty %s name" param-name)))))
+      (elisp-dev-mcp-test--verify-error-resp resp expected-msg))))
+
+(defun elisp-dev-mcp-test--verify-empty-name (tool-name param-name)
+  "Verify empty name handling for TOOL-NAME with PARAM-NAME."
+  (elisp-dev-mcp-test--verify-tool-call-error
+   tool-name
+   `((,param-name . ""))
+   (format "Empty %s name" param-name)))
 
 (defun elisp-dev-mcp-test--verify-invalid-type (tool-name param-name)
   "Verify invalid type handling for TOOL-NAME with PARAM-NAME."
-  (elisp-dev-mcp-test--with-server
-    (let* ((req
-            (mcp-server-lib-create-tools-call-request
-             tool-name 1 `((,param-name . 123))))
-           (resp
-            (mcp-server-lib-process-jsonrpc-parsed
-             req mcp-server-lib-ert-server-id)))
-      (elisp-dev-mcp-test--verify-error-resp
-       resp (format "Invalid %s name" param-name)))))
+  (elisp-dev-mcp-test--verify-tool-call-error
+   tool-name
+   `((,param-name . 123))
+   (format "Invalid %s name" param-name)))
 
 (defun elisp-dev-mcp-test--get-definition-response-data
     (function-name)
@@ -249,23 +253,66 @@ Returns the parsed JSON response object."
           `((function . ,function-name)))))
     (json-read-from-string text)))
 
+(defun elisp-dev-mcp-test--definition-fields
+    (parsed-resp expected-file)
+  "Assert PARSED-RESP is from EXPECTED-FILE; return (source start-line end-line)."
+  (let ((source (assoc-default 'source parsed-resp))
+        (file-path (assoc-default 'file-path parsed-resp))
+        (start-line (assoc-default 'start-line parsed-resp))
+        (end-line (assoc-default 'end-line parsed-resp)))
+    (should
+     (string= (file-name-nondirectory file-path) expected-file))
+    (list source start-line end-line)))
+
+(defun elisp-dev-mcp-test--verify-compressed-sample-definition ()
+  "Verify `elisp-get-function-definition' reads the compressed sample function."
+  (elisp-dev-mcp-test--with-server
+    (let* ((parsed-resp
+            (elisp-dev-mcp-test--get-definition-response-data
+             "elisp-dev-mcp-compressed-test--sample-function"))
+           (source (assoc-default 'source parsed-resp))
+           (file-path (assoc-default 'file-path parsed-resp)))
+      (should source)
+      (should
+       (string-match-p
+        "defun elisp-dev-mcp-compressed-test--sample-function"
+        source))
+      (should (string-match-p "Header comment" source))
+      (should
+       (string-match-p
+        "elisp-dev-mcp-compressed-test\\.el" file-path)))))
+
+(defun elisp-dev-mcp-test--verify-header-comment-docstring (text)
+  "Verify describe-function TEXT shows the with-header-comment docstring/params."
+  ;; Should include the docstring
+  (should
+   (string-match-p "Sample function with a header comment" text))
+  ;; Should include parameter documentation
+  (should (string-match-p "ARG1 is the first argument" text)))
+
+(defun elisp-dev-mcp-test--verify-mcp-server-lib-source (text)
+  "Verify TEXT is the mcp-server-lib.el source (header, metadata, footer)."
+  ;; Should contain the file header
+  (should (string-match-p ";;; mcp-server-lib.el" text))
+  ;; Should contain package metadata
+  (should (string-match-p "Model Context Protocol" text))
+  ;; Should end with proper footer
+  (should (string-match-p ";;; mcp-server-lib.el ends here" text)))
+
 (defun elisp-dev-mcp-test--verify-definition-in-test-file
     (function-name
      expected-start-line expected-end-line expected-source)
   "Verify function definition for FUNCTION-NAME is in test file.
 Checks that the function is defined in elisp-dev-mcp-test.el with
 EXPECTED-START-LINE, EXPECTED-END-LINE and EXPECTED-SOURCE."
-  (let* ((parsed-resp
-          (elisp-dev-mcp-test--get-definition-response-data
-           function-name))
-         (source (assoc-default 'source parsed-resp))
-         (file-path (assoc-default 'file-path parsed-resp))
-         (start-line (assoc-default 'start-line parsed-resp))
-         (end-line (assoc-default 'end-line parsed-resp)))
-
-    (should
-     (string=
-      (file-name-nondirectory file-path) "elisp-dev-mcp-test.el"))
+  (let* ((fields
+          (elisp-dev-mcp-test--definition-fields
+           (elisp-dev-mcp-test--get-definition-response-data
+            function-name)
+           "elisp-dev-mcp-test.el"))
+         (source (nth 0 fields))
+         (start-line (nth 1 fields))
+         (end-line (nth 2 fields)))
     (should (= start-line expected-start-line))
     (should (= end-line expected-end-line))
     (should (string= source expected-source))))
@@ -332,17 +379,10 @@ Returns the file contents as a string."
 
 (ert-deftest elisp-dev-mcp-test-describe-nonexistent-function ()
   "Test that `describe-function' MCP handler handles non-existent functions."
-  (elisp-dev-mcp-test--with-server
-    (let* ((req
-            (mcp-server-lib-create-tools-call-request
-             "elisp-describe-function"
-             1
-             `((function . "non-existent-function-xyz"))))
-           (resp
-            (mcp-server-lib-process-jsonrpc-parsed
-             req mcp-server-lib-ert-server-id)))
-      (elisp-dev-mcp-test--verify-error-resp
-       resp "Function non-existent-function-xyz is void"))))
+  (elisp-dev-mcp-test--verify-tool-call-error
+   "elisp-describe-function"
+   '((function . "non-existent-function-xyz"))
+   "Function non-existent-function-xyz is void"))
 
 (ert-deftest elisp-dev-mcp-test-describe-invalid-function-type ()
   "Test that `describe-function' handles non-string function names properly."
@@ -406,11 +446,7 @@ Returns the file contents as a string."
       (should
        (string-match-p
         "elisp-dev-mcp-test--with-header-comment ARG1 ARG2)" text))
-      ;; Should include the docstring
-      (should
-       (string-match-p "Sample function with a header comment" text))
-      ;; Should include parameter documentation
-      (should (string-match-p "ARG1 is the first argument" text)))))
+      (elisp-dev-mcp-test--verify-header-comment-docstring text))))
 
 (ert-deftest elisp-dev-mcp-test-describe-function-no-docstring ()
   "Test `describe-function' MCP handler with undocumented functions."
@@ -567,7 +603,7 @@ Any tool not found will be nil in the list."
   "Test that `elisp-get-function-definition' MCP handler works correctly."
   (elisp-dev-mcp-test--with-server
     (elisp-dev-mcp-test--verify-definition-in-test-file
-     "elisp-dev-mcp-test--without-header-comment" 57 60
+     "elisp-dev-mcp-test--without-header-comment" 59 62
      "(defun elisp-dev-mcp-test--without-header-comment (value)
   \"Simple function without a header comment.
 VALUE is multiplied by 2.\"
@@ -575,17 +611,10 @@ VALUE is multiplied by 2.\"
 
 (ert-deftest elisp-dev-mcp-test-get-nonexistent-function-definition ()
   "Test that `elisp-get-function-definition' handles non-existent functions."
-  (elisp-dev-mcp-test--with-server
-    (let* ((req
-            (mcp-server-lib-create-tools-call-request
-             "elisp-get-function-definition"
-             1
-             `((function . "non-existent-function-xyz"))))
-           (resp
-            (mcp-server-lib-process-jsonrpc-parsed
-             req mcp-server-lib-ert-server-id)))
-      (elisp-dev-mcp-test--verify-error-resp
-       resp "Function non-existent-function-xyz is not found"))))
+  (elisp-dev-mcp-test--verify-tool-call-error
+   "elisp-get-function-definition"
+   '((function . "non-existent-function-xyz"))
+   "Function non-existent-function-xyz is not found"))
 
 (ert-deftest elisp-dev-mcp-test-get-function-definition-invalid-type
     ()
@@ -614,7 +643,7 @@ VALUE is multiplied by 2.\"
   "Test that `elisp-get-function-definition' includes header comments."
   (elisp-dev-mcp-test--with-server
     (elisp-dev-mcp-test--verify-definition-in-test-file
-     "elisp-dev-mcp-test--with-header-comment" 42 52
+     "elisp-dev-mcp-test--with-header-comment" 44 54
      ";; This is a header comment that should be included
 ;; when extracting the function definition
 (defun elisp-dev-mcp-test--with-header-comment (arg1 arg2)
@@ -756,22 +785,7 @@ D captures remaining arguments."
 (ert-deftest elisp-dev-mcp-test-get-function-definition-compressed ()
   "Test `elisp-get-function-definition' reads from compressed .el.gz files."
   (elisp-dev-mcp-test--with-compressed-file
-    (elisp-dev-mcp-test--with-server
-      (let* ((parsed-resp
-              (elisp-dev-mcp-test--get-definition-response-data
-               "elisp-dev-mcp-compressed-test--sample-function"))
-             (source (assoc-default 'source parsed-resp))
-             (file-path (assoc-default 'file-path parsed-resp)))
-        ;; Verify we got the definition from .gz file
-        (should source)
-        (should
-         (string-match-p
-          "defun elisp-dev-mcp-compressed-test--sample-function"
-          source))
-        (should (string-match-p "Header comment" source))
-        (should
-         (string-match-p
-          "elisp-dev-mcp-compressed-test\\.el" file-path))))))
+    (elisp-dev-mcp-test--verify-compressed-sample-definition)))
 
 (ert-deftest
     elisp-dev-mcp-test-get-function-definition-compressed-no-auto-mode
@@ -807,23 +821,7 @@ This verifies that the code can read from .gz files even without
           ;; Now disable auto-compression-mode
           (auto-compression-mode -1)
           ;; Call the MCP tool - should succeed in reading .gz file
-          (elisp-dev-mcp-test--with-server
-            (let*
-                ((parsed-resp
-                  (elisp-dev-mcp-test--get-definition-response-data
-                   "elisp-dev-mcp-compressed-test--sample-function"))
-                 (source (assoc-default 'source parsed-resp))
-                 (file-path (assoc-default 'file-path parsed-resp)))
-              ;; Verify we got the definition from .gz file
-              (should source)
-              (should
-               (string-match-p
-                "defun elisp-dev-mcp-compressed-test--sample-function"
-                source))
-              (should (string-match-p "Header comment" source))
-              (should
-               (string-match-p
-                "elisp-dev-mcp-compressed-test\\.el" file-path)))))
+          (elisp-dev-mcp-test--verify-compressed-sample-definition))
       ;; Cleanup
       (setq load-path original-load-path)
       (auto-compression-mode
@@ -978,11 +976,7 @@ This verifies that the code can read from .gz files even without
       ;; Should show as "Lisp function" not "Lisp closure"
       (elisp-dev-mcp-test--check-dynamic-text text)
       (should-not (string-match-p "closure" text))
-      ;; Should include the docstring
-      (should
-       (string-match-p "Sample function with a header comment" text))
-      ;; Should include parameter documentation
-      (should (string-match-p "ARG1 is the first argument" text)))))
+      (elisp-dev-mcp-test--verify-header-comment-docstring text))))
 
 (ert-deftest
     elisp-dev-mcp-test-get-dynamic-binding-function-definition
@@ -1006,8 +1000,8 @@ This verifies that the code can read from .gz files even without
        (string=
         (file-name-nondirectory file-path)
         "elisp-dev-mcp-dynamic-test.el"))
-      (should (= start-line 30))
-      (should (= end-line 40))
+      (should (= start-line 32))
+      (should (= end-line 42))
       (should
        (string=
         source
@@ -1373,12 +1367,7 @@ X and Y are dynamically scoped arguments."
             t "^mcp-server-lib\\(-\\|$\\)")))
          (elpa-path (expand-file-name "mcp-server-lib.el" mcp-dir))
          (text (elisp-dev-mcp-test--read-source-file elpa-path)))
-    ;; Should contain the file header
-    (should (string-match-p ";;; mcp-server-lib.el" text))
-    ;; Should contain package metadata
-    (should (string-match-p "Model Context Protocol" text))
-    ;; Should end with proper footer
-    (should (string-match-p ";;; mcp-server-lib.el ends here" text))))
+    (elisp-dev-mcp-test--verify-mcp-server-lib-source text)))
 
 (ert-deftest elisp-dev-mcp-test-read-source-file-system ()
   "Test that `elisp-read-source-file` can read Emacs system files."
@@ -1451,14 +1440,7 @@ X and Y are dynamically scoped arguments."
           (let ((text
                  (elisp-dev-mcp-test--read-source-file
                   "mcp-server-lib")))
-            ;; Should contain the file header
-            (should (string-match-p ";;; mcp-server-lib.el" text))
-            ;; Should contain package metadata
-            (should (string-match-p "Model Context Protocol" text))
-            ;; Should end with proper footer
-            (should
-             (string-match-p
-              ";;; mcp-server-lib.el ends here" text))))
+            (elisp-dev-mcp-test--verify-mcp-server-lib-source text)))
       ;; Restore original load-path
       (setq load-path original-load-path))))
 
@@ -1675,20 +1657,16 @@ X and Y are dynamically scoped arguments."
     elisp-dev-mcp-test-get-bytecode-function-definition-with-header
     ()
   "Test `get-function-definition' with byte-compiled function with header."
-  (let* ((parsed-resp
-          (elisp-dev-mcp-test--with-bytecode-get-definition
-           "elisp-dev-mcp-bytecode-test--with-header"))
-         (source (assoc-default 'source parsed-resp))
-         (file-path (assoc-default 'file-path parsed-resp))
-         (start-line (assoc-default 'start-line parsed-resp))
-         (end-line (assoc-default 'end-line parsed-resp)))
-
-    (should
-     (string=
-      (file-name-nondirectory file-path)
-      "elisp-dev-mcp-bytecode-test.el"))
-    (should (= start-line 31))
-    (should (= end-line 36))
+  (let* ((fields
+          (elisp-dev-mcp-test--definition-fields
+           (elisp-dev-mcp-test--with-bytecode-get-definition
+            "elisp-dev-mcp-bytecode-test--with-header")
+           "elisp-dev-mcp-bytecode-test.el"))
+         (source (nth 0 fields))
+         (start-line (nth 1 fields))
+         (end-line (nth 2 fields)))
+    (should (= start-line 33))
+    (should (= end-line 38))
     (should
      (string-match-p
       ";; Header comment for byte-compiled function" source))
